@@ -1,0 +1,351 @@
+name: Build SukiSU Ultra Kernel - PJE110 (OnePlus Ace 3 / 12R)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SUPERKEY:
+        description: 'KernelPatch SuperKey（请设置自己的密钥！）'
+        required: true
+        default: 'MySuperSecretKey2026'
+      SUKISU_BRANCH:
+        description: 'SukiSU Ultra 分支'
+        required: true
+        default: 'susfs-dev'
+        type: choice
+        options:
+          - susfs-dev
+          - main
+      ENABLE_KPM:
+        description: '启用 KernelPatch (KPM)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      ENABLE_SUSFS:
+        description: '启用 SUSFS'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  # ── 设备信息 ──────────────────────────────────────────────
+  DEVICE_MODEL:    "OnePlus Ace 3 / OnePlus 12R"
+  DEVICE_CODE:     "PJE110"
+  DEVICE_CODENAME: "aston"
+  SOC:             "Snapdragon 8 Gen 2 (SM8550)"
+
+  # ── 内核信息（来自图片）──────────────────────────────────
+  KERNEL_VERSION:  "5.15.180-android13-8"
+  ANDROID_VERSION: "16"
+
+  # ── 内核源码 ─────────────────────────────────────────────
+  # aston 是 SM8550 设备，用 OnePlusOSS sm8550 内核源
+  KERNEL_REPO:    "OnePlusOSS/android_kernel_oneplus_sm8550"
+  KERNEL_BRANCH:  "android14-5.15"
+
+  # ── 工具链 ───────────────────────────────────────────────
+  CLANG_REPO:     "ZyCromerz/toolchains"
+  ARCH:           "arm64"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+    # ── 1. Checkout ─────────────────────────────────────────
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ── 2. 安装依赖 ──────────────────────────────────────────
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          git curl wget python3 python3-pip \
+          bc bison flex libssl-dev libelf-dev \
+          make gcc g++ \
+          zip unzip cpio binutils-aarch64-linux-gnu \
+          libncurses-dev pahole \
+          gzip bzip2 xz-utils lz4 zstd ccache
+        echo "Dependencies installed"
+
+    # ── 3. 克隆内核源码（OnePlus Ace 3 / aston / SM8550）────
+    - name: Clone kernel source
+      run: |
+        echo "Cloning OnePlus SM8550 kernel (aston / PJE110)..."
+        git clone --depth=1 \
+          --branch ${{ env.KERNEL_BRANCH }} \
+          https://github.com/${{ env.KERNEL_REPO }}.git \
+          kernel_src
+
+        # 也克隆内核模块
+        git clone --depth=1 \
+          --branch ${{ env.KERNEL_BRANCH }} \
+          https://github.com/OnePlusOSS/android_kernel_oneplus_sm8550-modules.git \
+          kernel_modules || echo "Modules repo not found, continuing..."
+
+        echo "Kernel source cloned:"
+        ls kernel_src/
+
+    # ── 4. 配置 Clang 工具链 ─────────────────────────────────
+    - name: Setup Clang toolchain
+      run: |
+        # 使用 Google Clang r522817（Android kernel 推荐版本）
+        mkdir -p toolchain
+        # 尝试从 Android CI 下载
+        wget -q --show-progress -O toolchain/clang.tar.gz \
+          "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz" || \
+        # Fallback：使用 proton-clang
+        wget -q --show-progress -O toolchain/clang.tar.zst \
+          "https://github.com/kdrag0n/proton-clang/releases/download/20240108/proton-clang-20240108-x86_64.tar.zst" || \
+        # Fallback 2：使用系统 clang
+        echo "Using system clang as fallback"
+
+        mkdir -p toolchain/clang-bin
+        if [ -f toolchain/clang.tar.gz ]; then
+          tar xf toolchain/clang.tar.gz -C toolchain/clang-bin --strip-components=0 2>/dev/null || true
+        elif [ -f toolchain/clang.tar.zst ]; then
+          tar xf toolchain/clang.tar.zst -C toolchain/clang-bin --strip-components=1 2>/dev/null || true
+        fi
+
+        # 找到 clang 二进制路径
+        CLANG_PATH=$(find toolchain/clang-bin -name "clang" -type f | head -1)
+        if [ -n "$CLANG_PATH" ]; then
+          CLANG_DIR=$(dirname "$CLANG_PATH")
+          echo "$CLANG_DIR" >> $GITHUB_PATH
+          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
+          echo "Clang found at: $CLANG_PATH"
+          "$CLANG_PATH" --version
+        else
+          echo "Using system clang"
+          which clang && clang --version
+        fi
+
+    # ── 5. 集成 SukiSU Ultra ─────────────────────────────────
+    - name: Integrate SukiSU Ultra
+      run: |
+        cd kernel_src
+        echo "Integrating SukiSU Ultra (branch: ${{ github.event.inputs.SUKISU_BRANCH }})..."
+        curl -LSs \
+          "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" \
+          | bash -s ${{ github.event.inputs.SUKISU_BRANCH }}
+        echo "SukiSU Ultra integration complete"
+
+    # ── 6. 下载 KernelPatch 工具 ─────────────────────────────
+    - name: Download KernelPatch tools
+      if: ${{ github.event.inputs.ENABLE_KPM == 'true' }}
+      run: |
+        mkdir -p kp_tools
+        echo "Fetching KernelPatch tools from SukiSU_KernelPatch_patch..."
+
+        # 获取最新 Release 信息
+        RELEASE_JSON=$(curl -s \
+          "https://api.github.com/repos/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest")
+
+        # 下载 kptools (linux x86_64)
+        KPTOOLS_URL=$(echo "$RELEASE_JSON" | python3 -c "
+        import sys,json
+        data=json.load(sys.stdin)
+        for a in data.get('assets',[]):
+            n=a['name'].lower()
+            if 'kptools' in n and ('linux' in n or 'x86_64' in n or 'amd64' in n):
+                print(a['browser_download_url']); break
+        " 2>/dev/null)
+
+        # 下载 kpimg
+        KPIMG_URL=$(echo "$RELEASE_JSON" | python3 -c "
+        import sys,json
+        data=json.load(sys.stdin)
+        for a in data.get('assets',[]):
+            n=a['name'].lower()
+            if n in ['kpimg','kpimg-android'] or (n.startswith('kpimg') and 'android' in n):
+                print(a['browser_download_url']); break
+        " 2>/dev/null)
+
+        echo "kptools URL: $KPTOOLS_URL"
+        echo "kpimg URL: $KPIMG_URL"
+
+        [ -n "$KPTOOLS_URL" ] && wget -q "$KPTOOLS_URL" -O kp_tools/kptools && chmod +x kp_tools/kptools
+        [ -n "$KPIMG_URL" ]   && wget -q "$KPIMG_URL"   -O kp_tools/kpimg
+
+        # 若自动获取失败则尝试直接路径
+        [ -f kp_tools/kptools ] || wget -q \
+          "https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest/download/kptools-linux" \
+          -O kp_tools/kptools 2>/dev/null || true
+        [ -f kp_tools/kpimg ] || wget -q \
+          "https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest/download/kpimg" \
+          -O kp_tools/kpimg 2>/dev/null || true
+
+        chmod +x kp_tools/kptools 2>/dev/null || true
+        ls -la kp_tools/
+
+    # ── 7. 编译内核 ───────────────────────────────────────────
+    - name: Build kernel
+      run: |
+        cd kernel_src
+        export ARCH=arm64
+        export SUBARCH=arm64
+
+        # 设置 Clang
+        export CLANG_DIR="${{ env.CLANG_DIR }}"
+        if [ -n "$CLANG_DIR" ] && [ -d "$CLANG_DIR" ]; then
+          export PATH="$CLANG_DIR:$PATH"
+        fi
+        export CC=clang
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+
+        MAKE_ARGS=(
+          ARCH=arm64
+          CC=clang
+          CLANG_TRIPLE=aarch64-linux-gnu-
+          CROSS_COMPILE=aarch64-linux-gnu-
+          LLVM=1
+          LLVM_IAS=1
+          -j$(nproc --all)
+        )
+
+        # aston defconfig（SM8550）
+        DEFCONFIG="aston_defconfig"
+        [ -f "arch/arm64/configs/$DEFCONFIG" ] || DEFCONFIG="vendor/aston_defconfig"
+        [ -f "arch/arm64/configs/$DEFCONFIG" ] || DEFCONFIG="pineapple_defconfig"
+        [ -f "arch/arm64/configs/$DEFCONFIG" ] || DEFCONFIG="gki_defconfig"
+
+        echo "Using defconfig: $DEFCONFIG"
+        make "${MAKE_ARGS[@]}" $DEFCONFIG O=out
+
+        # 启用 KernelSU manual hook（GKI 2.0 必须）
+        echo "CONFIG_KSU=y"              >> out/.config
+        echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
+
+        # 启用 SUSFS
+        if [ "${{ github.event.inputs.ENABLE_SUSFS }}" = "true" ]; then
+          echo "CONFIG_KSU_SUSFS=y"              >> out/.config
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y"     >> out/.config
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"    >> out/.config
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"   >> out/.config
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"  >> out/.config
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"   >> out/.config
+        fi
+
+        make "${MAKE_ARGS[@]}" O=out
+
+        # 提取内核镜像
+        for img in out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz; do
+          if [ -f "$img" ]; then
+            cp "$img" $GITHUB_WORKSPACE/Image
+            echo "KERNEL_IMAGE=$img" >> $GITHUB_ENV
+            echo "Kernel image saved: $img"
+            break
+          fi
+        done
+
+    # ── 8. 打 KernelPatch ────────────────────────────────────
+    - name: Apply KernelPatch
+      if: ${{ github.event.inputs.ENABLE_KPM == 'true' }}
+      run: |
+        if [ -f kp_tools/kptools ] && [ -f kp_tools/kpimg ] && [ -f Image ]; then
+          echo "Applying KernelPatch..."
+          ./kp_tools/kptools \
+            -p Image \
+            --kpimg kp_tools/kpimg \
+            --skey "${{ github.event.inputs.SUPERKEY }}" \
+            -o Image_kp
+
+          if [ $? -eq 0 ]; then
+            mv Image_kp Image
+            echo "KP_APPLIED=true" >> $GITHUB_ENV
+            echo "KernelPatch applied successfully!"
+          else
+            echo "KP_APPLIED=false" >> $GITHUB_ENV
+            echo "KernelPatch failed, using original kernel"
+          fi
+        else
+          echo "KP_APPLIED=false" >> $GITHUB_ENV
+          echo "Skipping KernelPatch (tools/image not found)"
+        fi
+
+    # ── 9. 打包 AnyKernel3 ZIP ───────────────────────────────
+    - name: Package AnyKernel3
+      run: |
+        # 获取 KernelSU 版 AnyKernel3（支持 GKI 设备）
+        git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git AK3_base
+
+        # 替换 anykernel.sh（使用我们自定义版本）
+        cp AnyKernel3/anykernel.sh AK3_base/anykernel.sh
+
+        # 放入内核镜像
+        [ -f Image ] && cp Image AK3_base/Image
+
+        # 放入 KernelPatch 工具
+        if [ "${{ env.KP_APPLIED }}" = "true" ] || [ -f kp_tools/kptools ]; then
+          mkdir -p AK3_base/tools AK3_base/patch
+          [ -f kp_tools/kptools ] && cp kp_tools/kptools AK3_base/tools/
+          [ -f kp_tools/kpimg ]   && cp kp_tools/kpimg   AK3_base/patch/
+        fi
+
+        # 构建文件名
+        KP_TAG=""
+        [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ] && KP_TAG="_KPM"
+        SF_TAG=""
+        [ "${{ github.event.inputs.ENABLE_SUSFS }}" = "true" ] && SF_TAG="_SUSFS"
+        DATE=$(date +%Y%m%d)
+        ZIP_NAME="AnyKernel3_SukiSU_Ultra_PJE110_Android16${KP_TAG}${SF_TAG}_${DATE}.zip"
+
+        cd AK3_base
+        zip -r9 "../$ZIP_NAME" . -x "*.git*" -x "*.md" -x "*placeholder*"
+        cd ..
+
+        echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+        echo "Package: $ZIP_NAME"
+        ls -lh "$ZIP_NAME"
+
+    # ── 10. Upload Artifact ───────────────────────────────────
+    - name: Upload AnyKernel3 ZIP
+      uses: actions/upload-artifact@v4
+      with:
+        name: SukiSU_Ultra_PJE110_Android16_KernelPatch
+        path: ${{ env.ZIP_NAME }}
+        retention-days: 30
+
+    # ── 11. Create Release ────────────────────────────────────
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: "sukisu-pje110-${{ github.run_number }}"
+        name: "SukiSU Ultra PJE110 Android16 KernelPatch #${{ github.run_number }}"
+        body: |
+          ## SukiSU Ultra Kernel — OnePlus Ace 3 / 12R (PJE110)
+
+          | 项目 | 信息 |
+          |------|------|
+          | 设备 | 一加 Ace 3 / OnePlus 12R (PJE110 / aston) |
+          | 处理器 | Qualcomm Snapdragon 8 Gen 2 (SM8550) |
+          | Android | 16 |
+          | 内核 | 5.15.180-android13-8 |
+          | SukiSU 分支 | ${{ github.event.inputs.SUKISU_BRANCH }} |
+          | KernelPatch | ${{ github.event.inputs.ENABLE_KPM }} |
+          | SUSFS | ${{ github.event.inputs.ENABLE_SUSFS }} |
+
+          ### 刷入步骤
+          1. 进入 TWRP / OrangeFox Recovery
+          2. 刷入本 ZIP
+          3. 重启
+          4. 安装 SukiSU Ultra Manager APK
+          5. 在 Manager 中修改 SuperKey
+
+          ### ⚠️ 请立即在 Manager 中更改 SuperKey！
+
+        files: ${{ env.ZIP_NAME }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
